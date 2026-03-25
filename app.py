@@ -64,15 +64,6 @@ def webhook():
             value    = changes["value"]
             messages = value.get("messages")
 
-            if "hola" in mensaje_recibido.lower():
-                respuesta = "¡Hola! ¿En qué te puedo ayudar?"
-            elif "precio" in mensaje_recibido.lower():
-                respuesta = "Nuestros precios son..."
-            else:
-                respuesta = "No entendí, escribe 'hola' para empezar"
-
-
-
             if messages:  # Si hay mensajes (a veces Meta envía otros eventos)
                 mensaje_recibido = messages[0]["text"]["body"]  
                 # El texto que escribió el usuario
