@@ -10,7 +10,7 @@ import requests
 import os        
 # Para leer las variables del archivo .env
 
-from dotenv import load_dotenv  
+from dotenv import load_dotenv
 # Carga el archivo .env automáticamente
 
 # ---- CONFIGURACIÓN ----
@@ -64,6 +64,15 @@ def webhook():
             value    = changes["value"]
             messages = value.get("messages")
 
+            if "hola" in mensaje_recibido.lower():
+                respuesta = "¡Hola! ¿En qué te puedo ayudar?"
+            elif "precio" in mensaje_recibido.lower():
+                respuesta = "Nuestros precios son..."
+            else:
+                respuesta = "No entendí, escribe 'hola' para empezar"
+
+
+
             if messages:  # Si hay mensajes (a veces Meta envía otros eventos)
                 mensaje_recibido = messages[0]["text"]["body"]  
                 # El texto que escribió el usuario
@@ -71,10 +80,17 @@ def webhook():
                 numero_usuario = messages[0]["from"]  
                 # El número de WhatsApp de quien te escribió
 
-                print(f"👤 De: {numero_usuario} | 💬 Mensaje: {mensaje_recibido}")
+                if "hola" in mensaje_recibido.lower():
+                    # Llamamos a la función que envía la respuesta
+                    enviar_mensaje(numero_usuario, f"¡Hola! ¿En qué te puedo ayudar?")
+                elif "precio" in mensaje_recibido.lower():
+                    # Llamamos a la función que envía la respuesta
+                    enviar_mensaje(numero_usuario, f"Nuestros precios son...")
+                else:
+                    # Llamamos a la función que envía la respuesta
+                    enviar_mensaje(numero_usuario, f"No entendí, escribe 'hola' para empezar")
 
-                # Llamamos a la función que envía la respuesta
-                enviar_mensaje(numero_usuario, f"Hola! Recibí tu mensaje: '{mensaje_recibido}' 🤖")
+                print(f"👤 De: {numero_usuario} | 💬 Mensaje: {mensaje_recibido}")
 
         except (KeyError, IndexError) as e:
             # Si la estructura del JSON no es la esperada, no crashea
