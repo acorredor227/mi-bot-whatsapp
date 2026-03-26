@@ -8,7 +8,7 @@ import requests
 # Para hacer llamadas HTTP a la API de Meta
 
 import os        
-# Para leer las variables del archivo .env
+#Para leer las variables del archivo .env
 
 from dotenv import load_dotenv
 # Carga el archivo .env automáticamente
