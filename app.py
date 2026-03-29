@@ -6,19 +6,9 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
-# json → para convertir la lista del historial a texto
-# y guardarlo en Redis (Redis solo guarda texto, no listas)
-
 from dotenv import load_dotenv
 from openai import OpenAI
 import redis
-# Cliente de Redis para guardar y leer el historial
-# de cada conversación por número de teléfono
-
-
-# ============================================================
-# CONFIGURACIÓN INICIAL
-# ============================================================
 
 load_dotenv()
 
@@ -31,78 +21,63 @@ OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 REDIS_URL       = os.getenv("REDIS_URL")
 
 cliente_openai = OpenAI(api_key=OPENAI_API_KEY)
+cliente_redis  = redis.from_url(REDIS_URL)
 
-cliente_redis = redis.from_url(REDIS_URL)
-# Crea la conexión a Redis usando la URL
-# from_url detecta automáticamente host, puerto y contraseña
-# desde la URL — más simple que configurar todo por separado
-
-# Cuántos mensajes recordar por conversación
-# 10 = 5 intercambios (5 del usuario + 5 del bot)
-# Más mensajes = más contexto pero más costo en OpenAI
 MAX_MENSAJES_HISTORIAL = 10
-
-SYSTEM_PROMPT = """
-Eres un asistente virtual amigable que responde por WhatsApp.
-Responde siempre en español, de forma concisa (máximo 3 párrafos cortos).
-Sé útil, amable y directo. No uses markdown como asteriscos o corchetes
-porque WhatsApp no los renderiza bien.
-"""
 
 
 # ============================================================
-# FUNCIONES DE MEMORIA
-# Guardan y leen el historial de cada usuario en Redis
+# DATOS DE TU TIENDA
+# Cambia estos datos por los de tu tienda real
+# ============================================================
+
+TIENDA = {
+    "nombre": "Mi Tienda",
+    "productos": [
+        {"nombre": "Producto A", "descripcion": "Descripción del producto A", "precio": "$10.000"},
+        {"nombre": "Producto B", "descripcion": "Descripción del producto B", "precio": "$25.000"},
+        {"nombre": "Producto C", "descripcion": "Descripción del producto C", "precio": "$50.000"},
+    ],
+    "contacto": "Para más información escríbenos al correo tienda@ejemplo.com o llámanos al 300 123 4567",
+    "horario": "Lunes a viernes 8am - 6pm"
+}
+
+SYSTEM_PROMPT = f"""
+Eres el asistente virtual de {TIENDA['nombre']}.
+Responde siempre en español, de forma concisa y amable.
+No uses markdown como asteriscos o corchetes porque WhatsApp no los renderiza.
+
+Información de la tienda:
+- Productos: {json.dumps(TIENDA['productos'], ensure_ascii=False)}
+- Contacto: {TIENDA['contacto']}
+- Horario: {TIENDA['horario']}
+
+Cuando el usuario pregunte por productos, precios o contacto,
+responde usando únicamente la información de la tienda de arriba.
+Si preguntan algo que no está en la información, di que no tienes
+esa información y sugiere contactar directamente.
+"""
+# Inyectamos los datos de la tienda directamente en el system prompt
+# Así ChatGPT solo responde con información real de tu tienda
+# y no inventa datos
+
+
+# ============================================================
+# FUNCIONES DE MEMORIA (sin cambios)
 # ============================================================
 
 def obtener_historial(numero_usuario):
-    """
-    Lee el historial de conversación de un usuario desde Redis.
-    Cada usuario tiene su propio historial identificado por su número.
-    """
     clave = f"historial:{numero_usuario}"
-    # La clave en Redis es única por usuario
-    # Ejemplo: "historial:573204281555"
-    # Así cada persona tiene su propia memoria separada
-
     datos = cliente_redis.get(clave)
-    # .get() busca el valor en Redis
-    # Si no existe (primera vez que escribe) devuelve None
-
     if datos:
         return json.loads(datos)
-        # json.loads convierte el texto guardado en Redis
-        # de vuelta a una lista de Python
-        # Ejemplo: '[{"role":"user","content":"hola"}]' → lista Python
     return []
-    # Si es la primera vez que escribe, devolvemos lista vacía
-
 
 def guardar_historial(numero_usuario, historial):
-    """
-    Guarda el historial actualizado de un usuario en Redis.
-    Limita el historial para no crecer infinitamente.
-    """
     clave = f"historial:{numero_usuario}"
-
-    # Limitamos el historial a los últimos MAX_MENSAJES_HISTORIAL
-    # Si hay más, eliminamos los más antiguos (pero nunca el system prompt)
-    # Esto controla el costo de OpenAI y el tamaño en Redis
     if len(historial) > MAX_MENSAJES_HISTORIAL:
         historial = historial[-MAX_MENSAJES_HISTORIAL:]
-        # [-10:] = toma solo los últimos 10 elementos de la lista
-
-    cliente_redis.setex(
-        clave,
-        86400,         # Tiempo de expiración en segundos
-                       # 86400 = 24 horas
-                       # Después de 24 horas de inactividad
-                       # la conversación se "olvida" automáticamente
-        json.dumps(historial)
-        # json.dumps convierte la lista Python a texto JSON
-        # para poder guardarlo en Redis
-        # Ejemplo: lista Python → '[{"role":"user","content":"hola"}]'
-    )
+    cliente_redis.setex(clave, 86400, json.dumps(historial))
 
 
 # ============================================================
@@ -116,16 +91,14 @@ def webhook():
         mode      = request.args.get("hub.mode")
         token     = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-
         if mode == "subscribe" and token == VERIFY_TOKEN:
             print("✅ Webhook verificado")
             return challenge, 200
-        else:
-            return "Token inválido", 403
+        return "Token inválido", 403
 
     if request.method == "POST":
         data = request.get_json()
-        print("📩 Mensaje recibido:", data)
+        print("📩 Evento recibido:", data)
 
         try:
             entry    = data["entry"][0]
@@ -134,88 +107,187 @@ def webhook():
             messages = value.get("messages")
 
             if messages:
-                tipo_mensaje = messages[0].get("type")
+                mensaje    = messages[0]
+                numero     = mensaje["from"]
+                tipo       = mensaje.get("type")
 
-                if tipo_mensaje != "text":
-                    print(f"⚠️ Tipo no soportado: {tipo_mensaje}")
-                    return jsonify({"status": "ok"}), 200
+                # --------------------------------------------------
+                # CASO 1: El usuario escribió texto
+                # --------------------------------------------------
+                if tipo == "text":
+                    texto = mensaje["text"]["body"].lower().strip()
+                    print(f"👤 Texto de {numero}: {texto}")
 
-                mensaje_recibido = messages[0]["text"]["body"]
-                numero_usuario   = messages[0]["from"]
+                    # Detectamos saludos para mostrar el menú
+                    saludos = ["hola", "hello", "hi", "buenas", "buen dia",
+                               "buenos dias", "buenas tardes", "buenas noches",
+                               "inicio", "menu", "menú", "start"]
 
-                print(f"👤 De: {numero_usuario} | 💬 {mensaje_recibido}")
+                    if any(saludo in texto for saludo in saludos):
+                        # Si saluda, mostramos el menú de botones
+                        enviar_botones(
+                            numero,
+                            f"¡Bienvenido a {TIENDA['nombre']}! 👋\n¿En qué te puedo ayudar hoy?",
+                            [
+                                {"id": "ver_productos", "title": "🛍️ Ver productos"},
+                                {"id": "ver_precios",   "title": "💰 Ver precios"},
+                                {"id": "contactar",     "title": "📞 Contactar"},
+                            ]
+                        )
+                    else:
+                        # Si escribe algo distinto a un saludo,
+                        # la IA responde con contexto de la tienda
+                        respuesta = preguntar_a_openai(numero, texto)
+                        enviar_mensaje(numero, respuesta)
 
-                respuesta_ia = preguntar_a_openai(numero_usuario, mensaje_recibido)
-                # Ahora pasamos también el número de usuario
-                # para poder leer y guardar su historial específico
+                # --------------------------------------------------
+                # CASO 2: El usuario tocó un botón
+                # --------------------------------------------------
+                elif tipo == "interactive":
+                    tipo_interactive = mensaje["interactive"]["type"]
+                    # WhatsApp envía "button_reply" cuando tocan un botón
+                    # y "list_reply" cuando eligen una opción de lista
 
-                enviar_mensaje(numero_usuario, respuesta_ia)
+                    if tipo_interactive == "button_reply":
+                        boton_id    = mensaje["interactive"]["button_reply"]["id"]
+                        boton_texto = mensaje["interactive"]["button_reply"]["title"]
+                        print(f"🔘 Botón tocado: {boton_id} por {numero}")
+
+                        # Según qué botón tocó, respondemos diferente
+                        if boton_id == "ver_productos":
+                            productos_texto = "\n".join([
+                                f"• {p['nombre']}: {p['descripcion']}"
+                                for p in TIENDA["productos"]
+                            ])
+                            # Construimos la lista de productos como texto
+                            # porque WhatsApp no soporta HTML ni formato especial
+                            enviar_mensaje(
+                                numero,
+                                f"Estos son nuestros productos:\n\n{productos_texto}\n\n"
+                                f"¿Te interesa alguno? Escríbeme y te doy más detalles 😊"
+                            )
+
+                        elif boton_id == "ver_precios":
+                            precios_texto = "\n".join([
+                                f"• {p['nombre']}: {p['precio']}"
+                                for p in TIENDA["productos"]
+                            ])
+                            enviar_mensaje(
+                                numero,
+                                f"Lista de precios:\n\n{precios_texto}\n\n"
+                                f"¿Quieres hacer un pedido? Escríbeme 🛒"
+                            )
+
+                        elif boton_id == "contactar":
+                            enviar_mensaje(
+                                numero,
+                                f"📞 Información de contacto:\n\n"
+                                f"{TIENDA['contacto']}\n\n"
+                                f"⏰ Horario: {TIENDA['horario']}"
+                            )
+
+                        # Después de responder al botón, guardamos
+                        # en el historial que el usuario eligió esa opción
+                        historial = obtener_historial(numero)
+                        historial.append({"role": "user",      "content": f"Elegí la opción: {boton_texto}"})
+                        historial.append({"role": "assistant", "content": f"Respondí sobre: {boton_id}"})
+                        guardar_historial(numero, historial)
+
+                else:
+                    print(f"⚠️ Tipo no soportado: {tipo}")
 
         except (KeyError, IndexError) as e:
-            print(f"⚠️ Error procesando mensaje: {e}")
+            print(f"⚠️ Error: {e}")
 
         return jsonify({"status": "ok"}), 200
 
 
 # ============================================================
-# FUNCIÓN: preguntar_a_openai (ahora con memoria)
+# FUNCIÓN: enviar_botones
+# Envía un mensaje con hasta 3 botones tocables
+# ============================================================
+
+def enviar_botones(numero_destino, texto_mensaje, botones):
+    """
+    numero_destino  → número del usuario
+    texto_mensaje   → el texto que aparece arriba de los botones
+    botones         → lista de dicts con "id" y "title"
+                      máximo 3 botones por mensaje
+    """
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    # Construimos la lista de botones en el formato que espera Meta
+    botones_formateados = [
+        {
+            "type": "reply",
+            # "reply" significa que al tocarlo envía una respuesta
+            "reply": {
+                "id": boton["id"],
+                # ID interno — lo usamos en el código para saber
+                # qué botón tocó el usuario (no lo ve el usuario)
+                "title": boton["title"]
+                # Texto visible del botón (máximo 20 caracteres)
+            }
+        }
+        for boton in botones
+        # Convertimos cada dict simple a formato Meta
+    ]
+
+    body = {
+        "messaging_product": "whatsapp",
+        "to": numero_destino,
+        "type": "interactive",
+        # "interactive" es el tipo para mensajes con botones o listas
+        "interactive": {
+            "type": "button",
+            # "button" para botones, "list" para listas desplegables
+            "body": {
+                "text": texto_mensaje
+                # El texto que aparece arriba de los botones
+            },
+            "action": {
+                "buttons": botones_formateados
+                # La lista de botones que construimos arriba
+            }
+        }
+    }
+
+    respuesta = requests.post(url, headers=headers, json=body)
+    print(f"📤 Botones enviados: {respuesta.status_code} - {respuesta.text}")
+
+
+# ============================================================
+# FUNCIÓN: preguntar_a_openai (con memoria, sin cambios)
 # ============================================================
 
 def preguntar_a_openai(numero_usuario, mensaje_usuario):
-
-    # 1. Leemos el historial previo de este usuario
     historial = obtener_historial(numero_usuario)
-    # Si es la primera vez, historial = []
-    # Si ya conversó antes, historial tiene los mensajes anteriores
-
-    # 2. Agregamos el mensaje nuevo del usuario al historial
-    historial.append({
-        "role": "user",
-        "content": mensaje_usuario
-    })
-    # Ahora el historial tiene todos los mensajes anteriores
-    # más el mensaje actual
+    historial.append({"role": "user", "content": mensaje_usuario})
 
     try:
         respuesta = cliente_openai.chat.completions.create(
             model="gpt-4o-mini",
-
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                # El system prompt va SIEMPRE primero
-                # Le dice a ChatGPT cómo comportarse en toda la conversación
-
                 *historial
-                # El * "desempaqueta" la lista del historial
-                # Es como escribir cada mensaje por separado
-                # Ejemplo si historial tiene 3 mensajes:
-                # {"role": "user", "content": "me llamo Alejandro"},
-                # {"role": "assistant", "content": "Hola Alejandro!"},
-                # {"role": "user", "content": "¿cómo me llamo?"}
             ],
-
             max_tokens=500,
             temperature=0.7
         )
-
         texto = respuesta.choices[0].message.content
-        print(f"🤖 Respuesta IA: {texto}")
+        print(f"🤖 IA: {texto}")
 
-        # 3. Guardamos la respuesta del bot en el historial
-        historial.append({
-            "role": "assistant",
-            "content": texto
-        })
-        # Ahora el historial queda completo:
-        # [...mensajes anteriores, mensaje usuario, respuesta bot]
-
-        # 4. Guardamos el historial actualizado en Redis
+        historial.append({"role": "assistant", "content": texto})
         guardar_historial(numero_usuario, historial)
-
         return texto
 
     except Exception as e:
-        print(f"❌ Error con OpenAI: {e}")
+        print(f"❌ Error OpenAI: {e}")
         return "Lo siento, tuve un problema. Intenta de nuevo."
 
 
@@ -225,21 +297,18 @@ def preguntar_a_openai(numero_usuario, mensaje_usuario):
 
 def enviar_mensaje(numero_destino, texto):
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
-
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
-
     body = {
         "messaging_product": "whatsapp",
         "to": numero_destino,
         "type": "text",
         "text": {"body": texto}
     }
-
     respuesta = requests.post(url, headers=headers, json=body)
-    print(f"📤 Respuesta de Meta: {respuesta.status_code} - {respuesta.text}")
+    print(f"📤 Mensaje: {respuesta.status_code} - {respuesta.text}")
 
 
 # ============================================================
